@@ -227,6 +227,467 @@ Latency Avg: 4.51 ms
 * **hey** — простой аналог ApacheBench с удобным интерфейсом.
 
 
+## HIGHLOAD++
+
+Главная проблема не в Axum. Главная проблема — **архитектура доступа к PostgreSQL**.
+
+Сейчас у тебя есть **один `tokio_postgres::Client` на весь сервер**.
+
+```rust
+struct AppState {
+    client: MyClient,
+    select_orders: Statement,
+}
+```
+
+`tokio-postgres` мультиплексирует запросы по одному TCP-соединению. Пока кажется, что это "асинхронно", но одно соединение с PostgreSQL становится узким местом. Именно поэтому ты видишь
+
+```
+/json     76k rps
+/orders   12k rps
+```
+
+Падение почти в **6 раз**.
+
+---
+
+## Что нужно изменить
+
+### 1. Убрать tokio-postgres
+
+Перейти на **sqlx + PgPool** или **deadpool-postgres**.
+
+Не один Client
+
+```
+Client
+```
+
+а
+
+```
+Pool
+ ├── conn1
+ ├── conn2
+ ├── conn3
+ ├── conn4
+ ├── ...
+ └── conn64
+```
+
+Иначе 400k RPS никогда не получить.
+
+---
+
+### 2. Не создавать Vec<Order>
+
+Сейчас
+
+```rust
+let mut orders = Vec::with_capacity(rows.len());
+
+for row in rows {
+    orders.push(Order {
+        ...
+    });
+}
+
+Json(orders)
+```
+
+Это:
+
+* allocation
+* сериализация через serde
+* куча try_get()
+
+Можно сразу сериализовать.
+
+Или использовать
+
+```rust
+sqlx::query_as!(
+    Order,
+    "SELECT ..."
+)
+```
+
+без try_get.
+
+---
+
+### 3. Самая большая потеря — serde_json
+
+Сейчас
+
+```
+Postgres
+↓
+
+Row
+
+↓
+
+Order
+
+↓
+
+serde_json
+
+↓
+
+Bytes
+```
+
+Лишние копирования.
+
+Лучше
+
+```
+query_as!
+
+↓
+
+Vec<Order>
+
+↓
+
+simd-json
+```
+
+или вообще
+
+```
+postgres -> json_build_object()
+```
+
+---
+
+### 4. Один prepared statement
+
+Сейчас
+
+```
+client.query(stmt)
+```
+
+всё равно уходит по одному соединению.
+
+Pool подготовит statement на каждом соединении.
+
+---
+
+### 5. TcpListener
+
+Стоит включить
+
+```
+TCP_NODELAY
+reuse_port
+```
+
+---
+
+### 6. Tokio runtime
+
+По умолчанию
+
+```
+#[tokio::main]
+```
+
+Лучше
+
+```rust
+#[tokio::main(flavor = "multi_thread")]
+```
+
+или
+
+```rust
+worker_threads = num_cpus::get()
+```
+
+---
+
+### 7. Hyper
+
+Для Hyper есть
+
+```
+http1_preserve_header_case(false)
+```
+
+```
+http1_title_case_headers(false)
+```
+
+```
+keepalive(true)
+```
+
+---
+
+### 8. Компиляция
+
+Обязательно
+
+```
+RUSTFLAGS="-C target-cpu=native"
+```
+
+и
+
+```
+cargo build --release
+```
+
+---
+
+### 9. JSON endpoint
+
+Даже
+
+```
+76k rps
+```
+
+для
+
+```
+{"message":"Hello"}
+```
+
+маловато.
+
+Можно вообще
+
+```rust
+async fn json() -> Response {
+    Response::builder()
+        .header(CONTENT_TYPE,"application/json")
+        .body(Body::from_static(br#"{"message":"Hello, World!"}"#))
+}
+```
+
+без IntoResponse.
+
+---
+
+## Самое большое узкое место
+
+Вот оно.
+
+```rust
+let (client, connection) = postgres_config.connect(NoTls).await?;
+```
+
+↓
+
+один TCP сокет
+
+↓
+
+все запросы
+
+↓
+
+один PostgreSQL backend process
+
+Это убивает производительность.
+
+---
+
+## Если цель действительно 400k RPS
+
+Тогда архитектура должна быть примерно такой
+
+```
+wrk
+
+↓
+
+SO_REUSEPORT
+
+↓
+
+Axum
+
+↓
+
+PgPool (64 connections)
+
+↓
+
+prepared statements
+
+↓
+
+sqlx::query_as!
+
+↓
+
+Bytes
+
+↓
+
+hyper
+```
+
+или вообще
+
+```
+wrk
+
+↓
+
+Axum
+
+↓
+
+DashMap cache
+
+↓
+
+Bytes
+```
+
+без обращения к PostgreSQL.
+
+---
+
+### Реалистичные ожидания
+
+На современном Ryzen/EPYC при запросе в PostgreSQL:
+
+* твой код — **10–20k RPS** (что и наблюдается);
+* после перехода на `PgPool` + `sqlx` — **50–120k RPS** в зависимости от железа и базы;
+* **400k RPS с чтением из PostgreSQL на каждый запрос** практически недостижимы на одной машине. Такие цифры обычно получают либо на полностью кэшируемых ответах, либо при работе с данными в памяти, либо на кластере из нескольких серверов. Если же речь о 400k RPS для `/json` (без БД), это достижимая цель при глубокой оптимизации стека HTTP и запуске на соответствующем оборудовании.
+
+Да. Для `/json` можно написать заметно более "низкоуровневый" обработчик. Основные идеи:
+
+* отказаться от `IntoResponse`;
+* не использовать `&str`;
+* использовать заранее созданный `Bytes`;
+* убрать `HeaderValue::from_static()` из каждого запроса;
+* не использовать `Json<T>` и `serde`;
+* заранее построить `Response`.
+
+Например так.
+
+```rust
+use std::{env, error::Error, io, sync::Arc};
+
+use axum::{
+    body::Body,
+    extract::State,
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderValue, Response, StatusCode,
+    },
+    routing::get,
+    Router,
+};
+use bytes::Bytes;
+use tokio::net::TcpListener;
+
+static JSON: &[u8] = br#"{"message":"Hello, World!"}"#;
+
+#[derive(Clone)]
+struct AppState {
+    json: Bytes,
+}
+
+#[inline(always)]
+async fn json(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let mut resp = Response::new(Body::from(state.json.clone()));
+
+    *resp.status_mut() = StatusCode::OK;
+
+    let headers = resp.headers_mut();
+
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_static("27"),
+    );
+
+    resp
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let bind_addr =
+        env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+
+    let app = Router::new()
+        .route("/json", get(json))
+        .with_state(Arc::new(AppState {
+            json: Bytes::from_static(JSON),
+        }));
+
+    let listener = TcpListener::bind(bind_addr).await?;
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+```
+
+---
+
+Еще быстрее можно сделать вообще без состояния.
+
+```rust
+use axum::{
+    body::Body,
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderValue, Response, StatusCode,
+    },
+};
+
+#[inline(always)]
+async fn json() -> Response<Body> {
+    let mut resp = Response::new(Body::from(
+        bytes::Bytes::from_static(br#"{"message":"Hello, World!"}"#),
+    ));
+
+    *resp.status_mut() = StatusCode::OK;
+
+    let h = resp.headers_mut();
+
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
+    h.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_static("27"),
+    );
+
+    resp
+}
+```
+
+---
+
+Но если цель — **максимально возможный RPS**, то проблема уже не в этом обработчике. На 70–100k RPS стоимость создания `Response`, `HeaderMap` и `Body` начинает доминировать. Дальше прирост дают уже:
+
+* переход с `axum` на чистый `hyper`;
+* использование `http-body-util::Full<Bytes>`;
+* заранее подготовленный `Response` с клонируемым телом (там, где это возможно);
+* настройка Hyper (`http1_only`, keep-alive, allocator и т. п.).
+
+Для статического JSON чистый Hyper обычно показывает на **10–30%** более высокий RPS, чем Axum, просто за счет меньшего количества абстракций.
+
+## DEBUG
+
 Мы исправили проблему: `WithGracefulShutdown` не реализует `Future` напрямую, но реализует `IntoFuture`. В `tokio::select!` нельзя использовать выражение с `.await`, но можно обернуть его в `async { server_future.await }`, что создаст `Future`. Также убрали ненужный `tokio::pin!`. Теперь код компилируется.
 
 Ниже приведён **окончательный, полностью рабочий** файл `src/main.rs`. Дополнительно обновлён `Cargo.toml` (убрана лишняя зависимость `hyper` – она уже включена через `axum`). Все тесты проходят.
