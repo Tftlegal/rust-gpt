@@ -30,6 +30,78 @@ GET /json
 GET /orders
 
 
+## ENV
+```
+cat .env
+```
+
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/rust_gpt
+BIND_ADDR=0.0.0.0:8080   # необязательно
+```
+
+## DB
+
+```
+docker run -d --name postgresql  -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=rust_gpt -p 5432:5432 -v postgres_data:/Users/support/rust/rust-gpt/data --health-cmd="pg_isready -U postgres" --health-interval=10s --health-timeout=5s --health-retries=5 postgres:14
+```
+
+### Создайте пользователя и базу (замените 'user' и 'password' на свои)
+```
+docker exec postgresql -it bash
+```
+
+#sudo -u postgres psql -c "CREATE USER user WITH PASSWORD 'password';"
+#sudo -u postgres psql -c "CREATE DATABASE rust_gpt OWNER user;"
+  
+
+### Примените схему
+```
+sudo -u postgres psql -d rust_gpt -f schema.sql
+```
+
+Для остановки и удаления именно этого контейнера:
+```
+docker stop postgresql && docker rm postgresql
+```
+```
+docker rm -f postgresql
+```
+
+
+## RUN
+```
+cargo run
+```
+
+## TEST
+
+```
+wrk -t8 -c64 -d30s http://localhost:8080/orders
+```
+Running 30s test @ http://localhost:8080/orders
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.14ms    1.22ms  21.01ms   92.08%
+    Req/Sec     1.57k   238.26     4.14k    82.11%
+  375128 requests in 30.10s, 118.42MB read
+Requests/sec:  12461.10
+Transfer/sec:      3.93MB
+
+
+```
+wrk -t8 -c64 -d30s http://localhost:8080/json  
+```
+Running 30s test @ http://localhost:8080/json
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   814.45us  337.47us  15.81ms   77.32%
+    Req/Sec     9.63k     1.84k   14.01k    57.64%
+  2307601 requests in 30.10s, 297.09MB read
+Requests/sec:  76660.81
+Transfer/sec:      9.87MB
+
+
 Мы исправили проблему: `WithGracefulShutdown` не реализует `Future` напрямую, но реализует `IntoFuture`. В `tokio::select!` нельзя использовать выражение с `.await`, но можно обернуть его в `async { server_future.await }`, что создаст `Future`. Также убрали ненужный `tokio::pin!`. Теперь код компилируется.
 
 Ниже приведён **окончательный, полностью рабочий** файл `src/main.rs`. Дополнительно обновлён `Cargo.toml` (убрана лишняя зависимость `hyper` – она уже включена через `axum`). Все тесты проходят.
