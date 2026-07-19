@@ -1,6 +1,6 @@
 # RUST GPT
 
-Структура полностью рабочий проекта.
+Структура полностью рабочего проекта.
 ```
 rust-gpt/
 ├── Cargo.toml
@@ -10,8 +10,8 @@ rust-gpt/
 │   └── main.rs
 └── README.md
 ```
-Я восстановлю:
-
+Я восстановил:
+```
 ✅ Cargo.toml
 ✅ src/main.rs (полностью компилируемый, максимально похожий на оригинал)
 ✅ schema.sql
@@ -19,28 +19,46 @@ rust-gpt/
 ✅ .env.example
 ✅ инструкцию запуска Linux/Windows/macOS
 ✅ команды создания БД PostgreSQL
-
+```
 Получится полноценный проект, который можно собрать командой
 ```
 cargo run
 ```
 и проверить
-
+```
 GET /json
 GET /orders
-
+```
 
 ## ENV
 ```
 cat .env
 ```
-
 ```
 DATABASE_URL=postgresql://user:password@localhost:5432/rust_gpt
 BIND_ADDR=0.0.0.0:8080   # необязательно
 ```
 
-## DB
+## BUILD axium
+```
+cargo build --release
+```
+
+## RUN
+```
+cargo run
+```
+
+
+## STOP axium
+```
+lsof -i :8080
+```
+```
+kill -9 57887
+```
+
+## DB Postgres 14
 
 ```
 docker run -d --name postgresql  -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=rust_gpt -p 5432:5432 -v postgres_data:/Users/support/rust/rust-gpt/data --health-cmd="pg_isready -U postgres" --health-interval=10s --health-timeout=5s --health-retries=5 postgres:14
@@ -66,12 +84,6 @@ docker stop postgresql && docker rm postgresql
 ```
 ```
 docker rm -f postgresql
-```
-
-
-## RUN
-```
-cargo run
 ```
 
 ## TEST
