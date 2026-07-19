@@ -1,23 +1,27 @@
 //! Axum + tokio-postgres сервер с кэшированием подготовленных запросов.
 //! Эндпоинты:
-//! - GET /json → возвращает `{"message":"Hello, World!"}`
+//! - GET /json → возвращает `{"message":"Hello, World!"}` (оптимизирован)
 //! - GET /orders → возвращает JSON-список первых 10 заказов из таблицы `orders`.
 
 use std::{collections::HashMap, env, error::Error, io, sync::Arc};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
-    http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderValue, Response, StatusCode,
+    },
+    response::{IntoResponse, Response as AxumResponse},
     routing::get,
 };
+use bytes::Bytes;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_postgres::{Client, NoTls, Statement};
 
 // Константы
-const HELLO_JSON: &str = r#"{"message":"Hello, World!"}"#;
 const SELECT_ORDERS: &str =
     "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10";
 
@@ -50,7 +54,7 @@ struct Order {
 struct DatabaseError(tokio_postgres::Error);
 
 impl IntoResponse for DatabaseError {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> AxumResponse {
         eprintln!("postgres request failed: {}", self.0);
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
@@ -72,7 +76,6 @@ struct MyClient {
 }
 
 impl MyClient {
-    /// Подготовить запрос с кэшированием (по SQL-тексту).
     async fn prepare_cached(&mut self, sql: &str) -> Result<Statement, tokio_postgres::Error> {
         if let Some(stmt) = self.cache.get(sql) {
             Ok(stmt.clone())
@@ -83,7 +86,6 @@ impl MyClient {
         }
     }
 
-    /// Выполнить подготовленный запрос с параметрами.
     async fn query(
         &self,
         stmt: &Statement,
@@ -97,15 +99,16 @@ impl MyClient {
 // Обработчики Axum
 // -----------------------------------------------------------------------------
 
-/// Возвращает статический JSON.
-async fn json() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        HELLO_JSON,
-    )
+/// Оптимизированный эндпоинт /json – без аллокаций, статический байтовый буфер.
+#[inline(always)]
+async fn json() -> Response<Body> {
+    const JSON_BYTES: &[u8] = br#"{"message":"Hello, World!"}"#;
+    let mut resp = Response::new(Body::from(Bytes::from_static(JSON_BYTES)));
+    *resp.status_mut() = StatusCode::OK;
+    let h = resp.headers_mut();
+    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    h.insert(CONTENT_LENGTH, HeaderValue::from_static("27"));
+    resp
 }
 
 /// Возвращает список заказов из БД.
@@ -115,7 +118,7 @@ async fn orders(
     let rows = state
         .client
         .query(&state.select_orders, &[])
-        .await?; // преобразование через From
+        .await?;
 
     let mut orders: Vec<Order> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -169,7 +172,6 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Загружаем переменные из .env (если есть)
     let _ = dotenvy::dotenv();
 
     let database_url = env::var("DATABASE_URL").map_err(|_| {
@@ -182,11 +184,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_addr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
 
-    // Парсим строку подключения и устанавливаем application_name
     let mut postgres_config: tokio_postgres::Config = database_url.parse()?;
     postgres_config.application_name("axum-battle");
 
-    // Устанавливаем соединение с БД
     let (client, connection) = postgres_config.connect(NoTls).await?;
 
     let mut my_client = MyClient {
@@ -194,14 +194,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cache: HashMap::with_capacity(1000),
     };
 
-    // Запускаем фоновую задачу, обслуживающую соединение
     let connection_task = tokio::spawn(connection);
-
-    // Подготавливаем запрос (с кэшированием)
     let select_orders = my_client.prepare_cached(SELECT_ORDERS).await?;
 
     let app = Router::new()
-        .route("/json", get(json))
+        .route("/json", get(json))        // оптимизированный обработчик
         .route("/orders", get(orders))
         .with_state(Arc::new(AppState {
             client: my_client,
@@ -209,12 +206,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }));
 
     let listener = TcpListener::bind(&bind_addr).await?;
-
     println!("axum-battle listening on http://{bind_addr}");
 
     let server_future = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    // Ожидаем завершения сервера или обрыва соединения с БД
     let outcome: Result<(), Box<dyn Error>> = tokio::select! {
         result = async { server_future.await } => result.map_err(Into::into),
         result = connection_task => {
@@ -240,7 +235,6 @@ mod tests {
     use reqwest::Client;
     use std::net::SocketAddr;
 
-    /// Запускает сервер на случайном порту и возвращает адрес и дроп-заглушку.
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let database_url = env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set for integration tests");
@@ -267,7 +261,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Запускаем сервер в отдельной задаче
         let server_handle = tokio::spawn(async {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok() })
@@ -287,7 +280,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["message"], "Hello, World!");
-
         handle.abort();
     }
 
@@ -300,7 +292,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let orders: Vec<Order> = resp.json().await.unwrap();
         assert!(orders.len() <= 10);
-
         handle.abort();
     }
 }
+
