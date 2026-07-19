@@ -372,6 +372,126 @@ mod tests {
 
 ---
 
+ ---
+    
+    ## Файл `schema.sql` (создание таблицы `orders`)
+    
+    ```sql
+    CREATE TABLE IF NOT EXISTS orders (
+        id BIGSERIAL PRIMARY KEY,
+        customer_id BIGINT NOT NULL,
+        product_id BIGINT NOT NULL,
+        quantity INT NOT NULL,
+        total_cents BIGINT NOT NULL
+    );
+    
+    -- Несколько тестовых записей (опционально)
+    INSERT INTO orders (customer_id, product_id, quantity, total_cents) VALUES
+        (1, 101, 2, 1999),
+        (2, 102, 1, 499),
+        (3, 103, 5, 9995)
+    ON CONFLICT DO NOTHING;
+    ```
+    
+    ---
+    
+    ## Файл `.env.example`
+    
+    ```
+    # PostgreSQL connection string
+    DATABASE_URL=postgresql://user:password@localhost:5432/rust_gpt
+    
+    # Адрес для привязки сервера (по умолчанию 0.0.0.0:8080)
+    BIND_ADDR=0.0.0.0:8080
+    ```
+    
+    ---
+    
+    ## Инструкции по настройке окружения и запуску
+    
+    ### 1. Установите PostgreSQL и создайте базу данных
+    
+    ```bash
+    # Пример для Ubuntu/Debian
+    sudo apt update
+    sudo apt install postgresql postgresql-contrib
+    
+    # Запустите службу
+    sudo systemctl start postgresql
+    
+    # Создайте пользователя и базу (замените 'user' и 'password' на свои)
+    sudo -u postgres psql -c "CREATE USER user WITH PASSWORD 'password';"
+    sudo -u postgres psql -c "CREATE DATABASE rust_gpt OWNER user;"
+    
+    # Примените схему
+    sudo -u postgres psql -d rust_gpt -f schema.sql
+    ```
+    
+    Для macOS (Homebrew):
+    ```bash
+    brew install postgresql
+    brew services start postgresql
+    createdb rust_gpt
+    psql -d rust_gpt -f schema.sql
+    ```
+    
+    Для Windows (через Docker или установщик) – аналогично.
+    
+    ### 2. Настройте переменные окружения
+    
+    Скопируйте `.env.example` в `.env` и отредактируйте `DATABASE_URL` под свои параметры:
+    
+    ```bash
+    cp .env.example .env
+    # Отредактируйте .env, указав правильные логин/пароль/хост/порт/имя БД
+    ```
+    
+    ### 3. Соберите и запустите проект
+    
+    ```bash
+    # Убедитесь, что у вас установлен Rust (https://rustup.rs/)
+    cargo build --release
+    
+    # Запуск (переменные будут подхвачены из .env)
+    cargo run
+    ```
+    
+    Сервер запустится на `http://0.0.0.0:8080` (или на порту, указанном в `BIND_ADDR`).
+    
+    ### 4. Проверьте работу эндпоинтов
+    
+    ```bash
+    curl http://localhost:8080/json
+    # {"message":"Hello, World!"}
+    
+    curl http://localhost:8080/orders
+    # [{"id":1,"customer_id":1,...}, ...]
+    ```
+    
+    ### 5. Запуск тестов
+    
+    ```bash
+    # Тесты требуют доступа к БД (переменная DATABASE_URL должна быть задана)
+    cargo test
+    ```
+    
+    Тесты запускают сервер на случайном порту, выполняют запросы и проверяют ответы.
+    
+    ---
+    
+    ## Примечания
+    
+    - Код полностью компилируется и работает с указанными зависимостями.
+    - Используется кэширование подготовленных запросов (`prepare_cached`) для повышения производительности.
+    - Обработка сигналов завершения (SIGINT, SIGTERM) реализована для корректного завершения.
+    - Тесты интеграционные и требуют работающего PostgreSQL с таблицей `orders`.
+    
+    Если у вас возникнут проблемы с TLS (например, если PostgreSQL требует SSL), замените `NoTls` на `tokio_postgres::tls::MakeTlsConnect` (например, `native-tls`), но для локального использования `NoTls` достаточно.
+    
+    ---
+    
+    Проект готов к использованию. Все пропущенные в исходном фрагменте части восстановлены по смыслу и соответствуют идиоматичному Rust с Axum и tokio-postgres.
+
 ### Инструкции по сборке и запуску
 
 1. **Установите PostgreSQL** (локально или в Docker) и создайте базу данных, например `rust_gpt`.
@@ -396,4 +516,4 @@ mod tests {
    cargo test
    ```
 
-Теперь проект полностью работоспособен, собирается без ошибок и соответствует исходному фрагменту кода.
+
