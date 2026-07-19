@@ -1,41 +1,63 @@
-//! Axum + tokio-postgres сервер с кэшированием подготовленных запросов.
-//! Эндпоинты:
-//! - GET /json → возвращает `{"message":"Hello, World!"}` (оптимизирован)
-//! - GET /orders → возвращает JSON-список первых 10 заказов из таблицы `orders`.
+//! Максимально производительный HTTP-сервер на Hyper 1.x с поддержкой PostgreSQL.
+//! - /json → статический JSON (быстро)
+//! - /orders → JSON-список заказов из БД
 
-use std::{collections::HashMap, env, error::Error, io, sync::Arc};
-
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::State,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderValue, Response, StatusCode,
-    },
-    response::{IntoResponse, Response as AxumResponse},
-    routing::get,
+use std::{
+    convert::Infallible,
+    future::Future,
+    net::SocketAddr,
+    os::fd::AsRawFd,
+    pin::Pin,
+    sync::Arc,
 };
+
 use bytes::Bytes;
+use deadpool_postgres::{Config, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use http_body_util::Full;
+use hyper::{
+    body::Incoming,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    server::conn::http1::Builder,
+    service::Service,
+    Request, Response, StatusCode,
+};
+use hyper_util::rt::TokioIo;
+use once_cell::sync::Lazy;
 use serde::Serialize;
-use tokio::net::TcpListener;
-use tokio_postgres::{Client, NoTls, Statement};
-
-// Константы
-const SELECT_ORDERS: &str =
-    "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10";
-
-// -----------------------------------------------------------------------------
-// Состояние приложения
-// -----------------------------------------------------------------------------
-
-struct AppState {
-    client: MyClient,
-    select_orders: Statement,
-}
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::{
+    net::TcpListener,
+    signal,
+    sync::oneshot,
+};
+use tokio_postgres::{NoTls, Row};
 
 // -----------------------------------------------------------------------------
-// Модель заказа
+// Константы и статические ответы для /json
+// -----------------------------------------------------------------------------
+
+const JSON_BYTES: &[u8] = br#"{"message":"Hello, World!"}"#;
+const JSON_LEN: usize = JSON_BYTES.len();
+type Body = Full<Bytes>;
+
+static JSON_RESPONSE: Lazy<Response<Body>> = Lazy::new(|| {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, JSON_LEN)
+        .body(Full::new(Bytes::from_static(JSON_BYTES)))
+        .unwrap()
+});
+
+static NOT_FOUND_RESPONSE: Lazy<Response<Body>> = Lazy::new(|| {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+});
+
+// -----------------------------------------------------------------------------
+// Модель Order и сериализация
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
@@ -47,252 +69,377 @@ struct Order {
     total_cents: i64,
 }
 
+/// Преобразует строку из PostgreSQL в Order
+fn row_to_order(row: Row) -> Result<Order, tokio_postgres::Error> {
+    Ok(Order {
+        id: row.try_get(0)?,
+        customer_id: row.try_get(1)?,
+        product_id: row.try_get(2)?,
+        quantity: row.try_get(3)?,
+        total_cents: row.try_get(4)?,
+    })
+}
+
 // -----------------------------------------------------------------------------
-// Обработчик ошибок базы данных
+// Состояние приложения (пул соединений с БД)
 // -----------------------------------------------------------------------------
 
-struct DatabaseError(tokio_postgres::Error);
+#[derive(Clone)]
+struct AppState {
+    pool: Pool,
+}
 
-impl IntoResponse for DatabaseError {
-    fn into_response(self) -> AxumResponse {
-        eprintln!("postgres request failed: {}", self.0);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+// -----------------------------------------------------------------------------
+// Кастомный Service с состоянием
+// -----------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AppService {
+    state: Arc<AppState>,
+}
+
+impl Service<Request<Incoming>> for AppService {
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let path = req.uri().path().to_owned();
+        let state = self.state.clone();
+
+        Box::pin(async move {
+            match path.as_str() {
+                "/json" => Ok(JSON_RESPONSE.clone()),
+                "/orders" => handle_orders(state).await,
+                _ => Ok(NOT_FOUND_RESPONSE.clone()),
+            }
+        })
     }
 }
 
-impl From<tokio_postgres::Error> for DatabaseError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        DatabaseError(err)
-    }
-}
-
 // -----------------------------------------------------------------------------
-// Клиент с кэшем подготовленных запросов
+// Обработчик /orders
 // -----------------------------------------------------------------------------
 
-struct MyClient {
-    client: Client,
-    cache: HashMap<String, Statement>,
-}
-
-impl MyClient {
-    async fn prepare_cached(&mut self, sql: &str) -> Result<Statement, tokio_postgres::Error> {
-        if let Some(stmt) = self.cache.get(sql) {
-            Ok(stmt.clone())
-        } else {
-            let stmt = self.client.prepare(sql).await?;
-            self.cache.insert(sql.to_string(), stmt.clone());
-            Ok(stmt)
-        }
-    }
-
-    async fn query(
-        &self,
-        stmt: &Statement,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-        self.client.query(stmt, params).await
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Обработчики Axum
-// -----------------------------------------------------------------------------
-
-/// Оптимизированный эндпоинт /json – без аллокаций, статический байтовый буфер.
-#[inline(always)]
-async fn json() -> Response<Body> {
-    const JSON_BYTES: &[u8] = br#"{"message":"Hello, World!"}"#;
-    let mut resp = Response::new(Body::from(Bytes::from_static(JSON_BYTES)));
-    *resp.status_mut() = StatusCode::OK;
-    let h = resp.headers_mut();
-    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    h.insert(CONTENT_LENGTH, HeaderValue::from_static("27"));
-    resp
-}
-
-/// Возвращает список заказов из БД.
-async fn orders(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Order>>, DatabaseError> {
-    let rows = state
-        .client
-        .query(&state.select_orders, &[])
-        .await?;
-
-    let mut orders: Vec<Order> = Vec::with_capacity(rows.len());
-    for row in rows {
-        orders.push(Order {
-            id: row.try_get(0)?,
-            customer_id: row.try_get(1)?,
-            product_id: row.try_get(2)?,
-            quantity: row.try_get(3)?,
-            total_cents: row.try_get(4)?,
-        });
-    }
-
-    Ok(Json(orders))
-}
-
-// -----------------------------------------------------------------------------
-// Обработка сигналов завершения (Unix)
-// -----------------------------------------------------------------------------
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(error) => {
-            eprintln!("failed to install SIGTERM handler: {error}");
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+async fn handle_orders(state: Arc<AppState>) -> Result<Response<Body>, Infallible> {
+    // Получаем соединение из пула
+    let client = match state.pool.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("failed to get DB connection: {}", e);
+            return Ok(internal_error_response());
         }
     };
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            if let Err(error) = result {
-                eprintln!("failed to install Ctrl+C handler: {error}");
+    // Выполняем запрос
+    let rows = match client
+        .query(
+            "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10",
+            &[],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("DB query failed: {}", e);
+            return Ok(internal_error_response());
+        }
+    };
+
+    // Преобразуем строки в заказы
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row_to_order(row) {
+            Ok(order) => orders.push(order),
+            Err(e) => {
+                eprintln!("failed to parse row: {}", e);
+                return Ok(internal_error_response());
             }
         }
-        _ = terminate.recv() => {}
     }
-}
 
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
-// -----------------------------------------------------------------------------
-// Точка входа
-// -----------------------------------------------------------------------------
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let _ = dotenvy::dotenv();
-
-    let database_url = env::var("DATABASE_URL").map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "DATABASE_URL must contain a PostgreSQL connection string",
-        )
-    })?;
-
-    let bind_addr = env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
-
-    let mut postgres_config: tokio_postgres::Config = database_url.parse()?;
-    postgres_config.application_name("axum-battle");
-
-    let (client, connection) = postgres_config.connect(NoTls).await?;
-
-    let mut my_client = MyClient {
-        client,
-        cache: HashMap::with_capacity(1000),
-    };
-
-    let connection_task = tokio::spawn(connection);
-    let select_orders = my_client.prepare_cached(SELECT_ORDERS).await?;
-
-    let app = Router::new()
-        .route("/json", get(json))        // оптимизированный обработчик
-        .route("/orders", get(orders))
-        .with_state(Arc::new(AppState {
-            client: my_client,
-            select_orders,
-        }));
-
-    let listener = TcpListener::bind(&bind_addr).await?;
-    println!("axum-battle listening on http://{bind_addr}");
-
-    let server_future = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-
-    let outcome: Result<(), Box<dyn Error>> = tokio::select! {
-        result = async { server_future.await } => result.map_err(Into::into),
-        result = connection_task => {
-            let message = match result {
-                Ok(Ok(())) => "PostgreSQL connection closed".to_owned(),
-                Ok(Err(error)) => format!("PostgreSQL connection failed: {error}"),
-                Err(error) => format!("PostgreSQL connection task failed: {error}"),
-            };
-            Err(io::Error::new(io::ErrorKind::ConnectionAborted, message).into())
+    // Сериализуем в JSON
+    let json = match serde_json::to_vec(&orders) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("failed to serialize JSON: {}", e);
+            return Ok(internal_error_response());
         }
     };
 
-    outcome
+    // Формируем успешный ответ
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, json.len())
+        .body(Full::new(Bytes::from(json)))
+        .unwrap())
+}
+
+/// Ответ 500 Internal Server Error
+fn internal_error_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
 }
 
 // -----------------------------------------------------------------------------
-// Тесты
+// Создание пула соединений с БД
+// -----------------------------------------------------------------------------
+
+fn create_pool(database_url: &str) -> Result<Pool, anyhow::Error> {
+    let config = database_url.parse::<tokio_postgres::Config>()?;
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let manager = Manager::from_config(config, NoTls, mgr_config);
+    let pool = Pool::builder(manager)
+        .max_size(16)
+        .runtime(Runtime::Tokio1)
+        .build()?;
+    Ok(pool)
+}
+
+// -----------------------------------------------------------------------------
+// Создание сокета с SO_REUSEPORT (Unix) через libc
+// -----------------------------------------------------------------------------
+
+fn create_listener(addr: SocketAddr, reuseport: bool) -> std::io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+
+    socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    if reuseport {
+        unsafe {
+            let yes: libc::c_int = 1;
+            let ret = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if reuseport {
+        eprintln!("SO_REUSEPORT not supported on this platform, ignoring");
+    }
+
+    socket.set_nodelay(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(4096)?;
+    socket.set_nonblocking(true)?;
+
+    TcpListener::from_std(socket.into())
+}
+
+// -----------------------------------------------------------------------------
+// Обработчик сигналов
+// -----------------------------------------------------------------------------
+
+async fn shutdown_signal() -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+        let _ = tx.send(());
+    });
+    rx
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    // Загружаем переменные из .env файла (если есть)
+    let _ = dotenvy::dotenv();
+
+    // Читаем переменные окружения
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set");
+    let bind_addr = std::env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
+
+    let addr: SocketAddr = bind_addr.parse()?;
+    let reuseport = std::env::var("SO_REUSEPORT").is_ok();
+
+    // Создаём пул соединений с БД
+    let pool = create_pool(&database_url)?;
+
+    // Создаём слушающий сокет
+    let listener = create_listener(addr, reuseport)?;
+    println!("Listening on http://{} (reuseport={})", addr, reuseport);
+
+    // Состояние приложения
+    let state = Arc::new(AppState { pool });
+    let service = AppService { state };
+
+    // HTTP-билдер
+    let mut builder = Builder::new();
+    builder.keep_alive(true);
+
+    let mut shutdown_rx = shutdown_signal().await;
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _)) => {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            eprintln!("failed to set TCP_NODELAY: {e}");
+                        }
+
+                        let io = TokioIo::new(stream);
+                        let service = service.clone();
+                        let builder = builder.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = builder.serve_connection(io, service).await {
+                                eprintln!("connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("accept error: {e}");
+                        break;
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                println!("Shutting down gracefully...");
+                break;
+            }
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Интеграционные тесты
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::Client;
-    use std::net::SocketAddr;
 
-    async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let database_url = env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set for integration tests");
-        let mut postgres_config: tokio_postgres::Config = database_url.parse().unwrap();
-        postgres_config.application_name("axum-battle-test");
+    async fn spawn_test_server() -> String {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = create_listener(addr, false).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{}", port);
 
-        let (client, connection) = postgres_config.connect(NoTls).await.unwrap();
-        let connection_task = tokio::spawn(connection);
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set for tests");
+        let pool = create_pool(&database_url).unwrap();
 
-        let mut my_client = MyClient {
-            client,
-            cache: HashMap::with_capacity(1000),
-        };
-        let select_orders = my_client.prepare_cached(SELECT_ORDERS).await.unwrap();
+        let state = Arc::new(AppState { pool });
+        let service = AppService { state };
 
-        let app = Router::new()
-            .route("/json", get(json))
-            .route("/orders", get(orders))
-            .with_state(Arc::new(AppState {
-                client: my_client,
-                select_orders,
-            }));
+        let mut builder = Builder::new();
+        builder.keep_alive(true);
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_handle = tokio::spawn(async {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok() })
-                .await
-                .unwrap();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        let io = TokioIo::new(stream);
+                        let service = service.clone();
+                        let builder = builder.clone();
+                        tokio::spawn(async move {
+                            let _ = builder.serve_connection(io, service).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("test server accept error: {e}");
+                        break;
+                    }
+                }
+            }
         });
 
-        (addr, server_handle)
+        url
     }
 
     #[tokio::test]
     async fn test_json_endpoint() {
-        let (addr, handle) = spawn_test_server().await;
-        let client = Client::new();
-        let url = format!("http://{}/json", addr);
-        let resp = client.get(&url).send().await.unwrap();
+        let base_url = spawn_test_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/json", base_url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["message"], "Hello, World!");
-        handle.abort();
     }
 
     #[tokio::test]
     async fn test_orders_endpoint() {
-        let (addr, handle) = spawn_test_server().await;
-        let client = Client::new();
-        let url = format!("http://{}/orders", addr);
-        let resp = client.get(&url).send().await.unwrap();
+        let base_url = spawn_test_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/orders", base_url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         let orders: Vec<Order> = resp.json().await.unwrap();
+        // Проверяем, что вернулся список (может быть пустым, но это нормально)
         assert!(orders.len() <= 10);
-        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_not_found() {
+        let base_url = spawn_test_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/unknown", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }
-
