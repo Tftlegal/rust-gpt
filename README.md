@@ -1,8 +1,8 @@
 # RUST GPT
 
-## Axium vs Huper
+## Axum vs Huper vs Actix
 
-Структура полностью рабочего проекта.
+Структура полностью рабочего проекта для Axum и Huper
 ```
 rust-gpt/
 ├── Cargo.toml
@@ -12,7 +12,7 @@ rust-gpt/
 │   └── main.rs
 └── README.md
 ```
-Я восстановил:
+
 ```
 ✅ Cargo.toml
 ✅ src/main.rs (полностью компилируемый, максимально похожий на оригинал)
@@ -22,7 +22,20 @@ rust-gpt/
 ✅ инструкцию запуска Linux/Windows/macOS
 ✅ команды создания БД PostgreSQL
 ```
-Получится полноценный проект, который можно собрать командой
+
+Для Actix добавил еще добавлены метрики CPU/RAM (По хорошему нужно дробавить мониторинг  пула PG)
+```
+rust-gpt/
+├── Cargo.toml
+├── .env
+├── schema.sql
+└── src/
+    ├── main.rs
+    ├── models.rs
+    └── routes.rs
+```
+
+Получиился  полноценный проект микросервиса, который можно собрать командой
 ```
 cargo run
 ```
@@ -88,7 +101,7 @@ docker stop postgresql && docker rm postgresql
 docker rm -f postgresql
 ```
 
-## TEST axium
+## TEST axum
 
 
 ```
@@ -148,7 +161,40 @@ Requests/sec:   3240.95
 Transfer/sec:      1.02MB
 ```
 
+
+## TEST actix
+
+
+```
+wrk -t8 -c64 -d30s http://localhost:8080/orders
+```
+Running 30s test @ http://localhost:8080/orders
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    15.08ms    8.02ms 188.86ms   99.08%
+    Req/Sec   549.79     60.84   700.00     78.33%
+  131206 requests in 30.03s, 41.42MB read
+Requests/sec:   4369.17
+Transfer/sec:      1.38MB
+
+```
+wrk -t8 -c64 -d30s http://localhost:8080/json  
+```
+```
+Running 30s test @ http://localhost:8080/json
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.99ms    1.33ms  26.25ms   90.74%
+    Req/Sec    11.55k     1.26k   15.26k    70.50%
+  2765517 requests in 30.10s, 356.05MB read
+Requests/sec:  91877.47
+Transfer/sec:     11.83MB
+```
+
+## SOFT 
+
 По формату вывода это **`wrk`** — очень популярная утилита для HTTP-бенчмаркинга.
+
 
 Именно для `wrk` характерны строки:
 
@@ -1076,7 +1122,6 @@ mod tests {
 
 ---
 
- ---
     
     ## Файл `schema.sql` (создание таблицы `orders`)
     
@@ -1988,4 +2033,291 @@ wrk -t8 -c64 -d30s http://127.0.0.1:8080/json
 * pinned worker threads.
 
 Такой сервер обычно еще на **20–40% быстрее**, чем обычный Hyper, и именно он уже приближается к пределу производительности HTTP-стека.
+
+
+## Actix base 90k/4k RPS
+
+Мы реализуем приложение на **Actix-web** с тремя эндпоинтами:
+
+- `GET /json` – статический JSON `{"message":"Hello, World!"}`
+- `GET /orders` – список заказов из PostgreSQL (таблица `orders`)
+- `GET /metrics` – метрики CPU и RAM (в процентах и байтах)
+
+Используем `deadpool-postgres` для пула соединений, `serde` для сериализации, `sysinfo` для сбора системных метрик, `dotenvy` для загрузки `.env`.
+
+---
+
+## Структура проекта
+
+```
+rust-gpt-actix/
+├── Cargo.toml
+├── .env
+├── schema.sql
+└── src/
+    ├── main.rs
+    ├── models.rs
+    └── routes.rs
+```
+
+---
+
+## 1. `Cargo.toml`
+
+```toml
+[package]
+name = "rust-gpt-actix"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+deadpool-postgres = "0.12"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-0_8"] }
+dotenvy = "0.15"
+sysinfo = "0.30"
+anyhow = "1"
+num_cpus = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+```
+
+---
+
+## 2. `schema.sql` (создание таблицы `orders`)
+
+```sql
+CREATE TABLE IF NOT EXISTS orders (
+    id BIGSERIAL PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    total_cents BIGINT NOT NULL
+);
+
+-- Тестовые данные
+INSERT INTO orders (customer_id, product_id, quantity, total_cents) VALUES
+    (1, 101, 2, 1999),
+    (2, 102, 1, 499),
+    (3, 103, 5, 9995)
+ON CONFLICT (id) DO NOTHING;
+```
+
+---
+
+## 3. `.env` (пример)
+
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/rust_gpt
+BIND_ADDR=0.0.0.0:8080
+```
+
+---
+
+## 4. `src/models.rs`
+
+```rust
+use serde::Serialize;
+
+/// Модель заказа (соответствует таблице orders)
+#[derive(Debug, Serialize)]
+pub struct Order {
+    pub id: i64,
+    pub customer_id: i64,
+    pub product_id: i64,
+    pub quantity: i32,
+    pub total_cents: i64,
+}
+```
+
+---
+
+## 5. `src/routes.rs`
+
+```rust
+use actix_web::{get, web, HttpResponse, Responder};
+use deadpool_postgres::Pool;
+use serde_json::json;
+use std::sync::Arc;
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+use crate::models::Order;
+
+/// Статический JSON
+#[get("/json")]
+async fn json_handler() -> impl Responder {
+    HttpResponse::Ok().json(json!({ "message": "Hello, World!" }))
+}
+
+/// Список заказов из БД
+#[get("/orders")]
+async fn orders_handler(pool: web::Data<Arc<Pool>>) -> impl Responder {
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Failed to get DB connection: {}", e);
+            return HttpResponse::InternalServerError().body("DB connection error");
+        }
+    };
+
+    let rows = match client
+        .query(
+            "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10",
+            &[],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("DB query failed: {}", e);
+            return HttpResponse::InternalServerError().body("Query error");
+        }
+    };
+
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        let order = Order {
+            id: row.try_get(0).unwrap_or_default(),
+            customer_id: row.try_get(1).unwrap_or_default(),
+            product_id: row.try_get(2).unwrap_or_default(),
+            quantity: row.try_get(3).unwrap_or_default(),
+            total_cents: row.try_get(4).unwrap_or_default(),
+        };
+        orders.push(order);
+    }
+
+    HttpResponse::Ok().json(orders)
+}
+
+/// Метрики CPU и RAM
+#[get("/metrics")]
+async fn metrics_handler() -> impl Responder {
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new()
+            .with_cpu(CpuRefreshKind::new().with_cpu_usage())
+            .with_memory(MemoryRefreshKind::new().with_ram()),
+    );
+    sys.refresh_all();
+
+    // CPU usage (среднее по всем ядрам)
+    let cpu_usage = sys.global_cpu_info().cpu_usage();
+
+    // RAM usage
+    let total_memory = sys.total_memory();
+    let used_memory = sys.used_memory();
+    let memory_usage_percent = if total_memory > 0 {
+        (used_memory as f64 / total_memory as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let metrics = json!({
+        "cpu_usage_percent": cpu_usage,
+        "memory_usage_percent": memory_usage_percent,
+        "memory_used_bytes": used_memory,
+        "memory_total_bytes": total_memory,
+    });
+
+    HttpResponse::Ok().json(metrics)
+}
+```
+
+---
+
+## 6. `src/main.rs`
+
+```rust
+mod models;
+mod routes;
+
+use actix_web::{web, App, HttpServer};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use dotenvy::dotenv;
+use std::env;
+use std::sync::Arc;
+
+use routes::{json_handler, metrics_handler, orders_handler};
+
+/// Создаёт пул соединений с PostgreSQL
+fn create_pool(database_url: &str) -> Result<Pool, anyhow::Error> {
+    let config = database_url.parse::<tokio_postgres::Config>()?;
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let manager = Manager::from_config(config, tokio_postgres::NoTls, mgr_config);
+    let pool = Pool::builder(manager)
+        .max_size(16)
+        .runtime(Runtime::Tokio1)
+        .build()?;
+    Ok(pool)
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let _ = dotenv();
+
+    let database_url = env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set (in .env or environment)");
+
+    let pool = match create_pool(&database_url) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("Failed to create DB pool: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let bind_addr = env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
+
+    println!("Starting server on http://{}", bind_addr);
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .service(json_handler)
+            .service(orders_handler)
+            .service(metrics_handler)
+    })
+    .workers(num_cpus::get()) // используем все ядра
+    .bind(&bind_addr)?
+    .run()
+    .await
+}
+```
+
+---
+
+## Запуск
+
+1. Установите PostgreSQL, создайте базу `rust_gpt` и примените `schema.sql`.
+2. Создайте `.env` с корректной `DATABASE_URL`.
+3. Соберите и запустите:
+   ```bash
+   cargo build --release
+   ./target/release/rust-gpt-actix
+   ```
+4. Проверьте ручки:
+   ```bash
+   curl http://localhost:8080/json
+   curl http://localhost:8080/orders
+   curl http://localhost:8080/metrics
+   ```
+
+---
+
+## Особенности
+
+- Используется `num_cpus::get()` для количества рабочих потоков Actix (по умолчанию `workers` = 2, но мы увеличиваем до числа ядер).
+- Пул соединений с БД настроен на 16 соединений (можно менять).
+- Метрики CPU/RAM собираются через `sysinfo` – актуальны на момент запроса.
+- Код максимально приближен к исходному на Hyper, но использует удобства Actix-web (макросы, Data).
+
+Теперь у вас есть полноценный Actix-сервер с теми же ручками, что и в исходном проекте. 🚀
 
