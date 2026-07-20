@@ -2,6 +2,12 @@
 
 ## Axum vs Huper vs Actix
 
+```
+500M	rust-hyper
+629M    rust-axum
+1,3G    rust-actix
+```
+
 Структура полностью рабочего проекта для Axum и Huper
 ```
 rust-gpt/
@@ -19,11 +25,11 @@ rust-gpt/
 ✅ schema.sql
 ✅ тесты
 ✅ .env.example
-✅ инструкцию запуска Linux/Windows/macOS
+✅ README.md инструкция запуска Linux/Windows/macOS
 ✅ команды создания БД PostgreSQL
 ```
 
-Для Actix добавил еще добавлены метрики CPU/RAM (По хорошему нужно дробавить мониторинг  пула PG)
+Для Actix еще добавлены метрики CPU/RAM (По хорошему нужно дробавить мониторинг пула PG)
 ```
 rust-gpt/
 ├── Cargo.toml
@@ -36,13 +42,22 @@ rust-gpt/
 ```
 
 Получиился  полноценный проект микросервиса, который можно собрать командой
+
+```
+cargo build --release
+```
+
+И запустить
+
 ```
 cargo run
 ```
-и проверить
+
+и проверить 
 ```
 GET /json
 GET /orders
+GET /metrics (Только для Actix)
 ```
 
 ## ENV
@@ -54,7 +69,7 @@ DATABASE_URL=postgresql://user:password@localhost:5432/rust_gpt
 BIND_ADDR=0.0.0.0:8080   # необязательно
 ```
 
-## BUILD axium
+## BUILD
 ```
 cargo build --release
 ```
@@ -65,7 +80,7 @@ cargo run
 ```
 
 
-## STOP axium
+## STOP axum
 ```
 lsof -i :8080
 ```
@@ -364,7 +379,7 @@ Pool
  └── conn64
 ```
 
-Иначе 400k RPS никогда не получить.
+Иначе 400k RPS никогда не получить!!! 
 
 ---
 
@@ -430,7 +445,9 @@ Bytes
 
 Лишние копирования.
 
-Лучше
+
+
+Лучше:
 
 ```
 query_as!
@@ -444,7 +461,8 @@ Vec<Order>
 simd-json
 ```
 
-или вообще
+
+или вообще:
 
 ```
 postgres -> json_build_object()
@@ -549,7 +567,8 @@ cargo build --release
 
 маловато.
 
-Можно вообще
+
+Можно вообще:
 
 ```rust
 async fn json() -> Response {
@@ -651,7 +670,8 @@ Bytes
 
 * твой код — **10–20k RPS** (что и наблюдается);
 * после перехода на `PgPool` + `sqlx` — **50–120k RPS** в зависимости от железа и базы;
-* **400k RPS с чтением из PostgreSQL на каждый запрос** практически недостижимы на одной машине. Такие цифры обычно получают либо на полностью кэшируемых ответах, либо при работе с данными в памяти, либо на кластере из нескольких серверов. Если же речь о 400k RPS для `/json` (без БД), это достижимая цель при глубокой оптимизации стека HTTP и запуске на соответствующем оборудовании.
+* **400k RPS с чтением из PostgreSQL на каждый запрос** практически недостижимы на одной машине. Такие цифры обычно получают либо на полностью кэшируемых ответах, либо при работе с данными в памяти, либо на кластере из нескольких серверов. 
+* Если же речь о 400k RPS для `/json` (без БД), это достижимая цель при глубокой оптимизации стека HTTP и запуске на соответствующем оборудовании.
 
 Да. Для `/json` можно написать заметно более "низкоуровневый" обработчик. Основные идеи:
 
@@ -1200,7 +1220,6 @@ mod tests {
     ```bash
     # Убедитесь, что у вас установлен Rust (https://rustup.rs/)
     cargo build --release
-    
     # Запуск (переменные будут подхвачены из .env)
     cargo run
     ```
@@ -2321,3 +2340,676 @@ async fn main() -> std::io::Result<()> {
 
 Теперь у вас есть полноценный Actix-сервер с теми же ручками, что и в исходном проекте. 🚀
 
+
+## PG SET 
+
+### USER
+#CPU
+```
+docker stats --no-stream --format "{{.Container}}\t{{.Name}}\t{{.CPUPerc}}" | sort -k3 -r
+```
+aa858f8798a0ee0f83b44114659b89094e6c7a883159e14d9bef554da6e300ad	postgresql	209.44%
+
+#RAM
+```
+docker stats --no-stream --format "{{.Container}}\t{{.Name}}\t{{.MemPerc}}" | sort -k3 -r
+```
+aa858f8798a0ee0f83b44114659b89094e6c7a883159e14d9bef554da6e300ad	postgresql	1.14%
+
+
+#CPU/RAM
+Вот однострочная команда, которая выводит оба показателя сразу (с сортировкой по CPU, как в вашем первом примере):
+
+```bash
+docker stats --no-stream --format "{{.Container}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemPerc}}" | sort -k3 -r
+```
+
+*Примечание: если вы захотите сортировать вывод по RAM, просто замените `-k3` на `-k4`.*
+
+```bash
+docker stats --no-stream --format "{{.Container}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemPerc}}" | sort -k3 -r
+```
+aa858f8798a0ee0f83b44114659b89094e6c7a883159e14d9bef554da6e300ad	postgresql	217.83%	1.15%
+
+```bash
+curl -s http://localhost:8080/metrics                                                                  
+```
+{"cpu_usage_percent":4.573661804199219,"memory_total_bytes":17179869184,"memory_usage_percent":64.30449485778809,"memory_used_bytes":11047428096}
+
+Интерпретация данных указывает на классическую **CPU-bound (процессорно-ограниченную)** нагрузку в контейнере PostgreSQL, при этом система в целом чувствует себя стабильно. 
+
+Вот детальный разбор:
+
+### 1. Разбор метрик контейнера (`docker stats`)
+* **CPU: 217.83%** – Контейнер активно использует примерно **2.2 ядра** процессора. Это высокая локальная нагрузка, указывающая на тяжелые вычисления внутри БД.
+* **RAM: 1.15%** – Потребление памяти контейнером крайне низкое (при 16 ГБ общей памяти это около ~180–200 МБ). Это означает, что **утечки памяти нет**, и запросы не требуют выделения больших объемов оперативной памяти (например, нет гигантских сортировок или хэш-таблиц, выходящих за пределы `work_mem`).
+
+### 2. Разбор метрик приложения/хоста (`curl :8080/metrics`)
+* **CPU: 4.57%** – Это, скорее всего, общая загрузка процессора **всего хоста** (или процесса, отдающего метрики). 
+  *💡 Интересное наблюдение:* Если контейнер использует 217% (2.17 ядра), а это составляет 4.57% от общей мощности хоста, то математически ваш сервер имеет **около 48 логических ядер** (2.17 / 0.0457 ≈ 47.5). Если это так, то нагрузка на весь сервер все еще очень низкая и безопасная.
+* **RAM: 64.3% (10.28 ГБ из 16 ГБ)** – Память хоста занята нормально. Разница между 1.15% у контейнера и 64% у хоста говорит о том, что остальная память занята либо другими контейнерами, либо (что вероятнее для БД) **кэшем файловой системы ОС (OS Page Cache)**. PostgreSQL активно использует кэш ОС для чтения данных с диска, что не всегда полностью отражается в лимитах памяти Docker, но сильно экономит время и грузит CPU обработкой этих данных.
+
+### 3. Итоговый диагноз
+Нагрузка вызвана **неоптимальными или тяжелыми запросами**, которые:
+1. Уже работают с данными, закэшированными в RAM (поэтому нет высокого I/O и роста памяти контейнера).
+2. Требуют интенсивных вычислений: полное сканирование таблиц (Seq Scan) из-за отсутствия индексов, сложные `JOIN`, агрегации (`GROUP BY`), сортировки (`ORDER BY`) или обработка больших текстовых полей/регулярных выражений.
+3. Либо это фоновый процесс: `autovacuum`, перестроение индекса (`REINDEX`) или создание бэкапа.
+
+### 4. Что сделать прямо сейчас (рекомендации)
+
+Подключитесь к PostgreSQL и выполните следующие шаги:
+
+**Шаг 1. Найдите активные "тяжелые" запросы:**
+```sql
+SELECT 
+    pid, 
+    now() - pg_stat_activity.query_start AS duration, 
+    query, 
+    state 
+FROM pg_stat_activity 
+WHERE state = 'active' 
+  AND pid <> pg_backend_pid() 
+ORDER BY duration DESC 
+LIMIT 5;
+```
+
+**Шаг 2. Проанализируйте план выполнения:**
+Возьмите самый долгий запрос из результата выше и добавьте перед ним `EXPLAIN ANALYZE`, чтобы увидеть, где именно теряется время (например, ищите `Seq Scan` на больших таблицах).
+
+**Шаг 3. Проверьте фоновые задачи:**
+Если в `pg_stat_activity` нет явных пользовательских запросов, проверьте, не работает ли `autovacuum`:
+```sql
+SELECT pid, query, state FROM pg_stat_activity WHERE query LIKE '%autovacuum%';
+```
+
+**Вывод:** Серверу ничего не угрожает (памяти достаточно, общая загрузка CPU низкая), но конкретный запрос в PostgreSQL работает неэффективно и "съедает" 2 ядра. Оптимизация индексов или самого запроса решит проблему.
+
+### USER
+rust_gpt=# SELECT 
+    pid, 
+    now() - pg_stat_activity.query_start AS duration, 
+    query, 
+    state 
+FROM pg_stat_activity 
+WHERE state = 'active' 
+  AND pid <> pg_backend_pid() 
+ORDER BY duration DESC 
+LIMIT 5;
+  pid  |     duration     |                                           query                                            | state  
+-------+------------------+--------------------------------------------------------------------------------------------+--------
+ 27160 | -00:00:00.001112 | SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10 | active
+ 27158 | -00:00:00.001119 | SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10 | active
+
+### ASSISTANT
+Отрицательное значение длительности (`-00:00:00.001112`) — это известный артефакт PostgreSQL, который означает, что запрос выполнился **быстрее миллисекунды** (практически мгновенно). 
+
+Это меняет картину: **сам по себе этот запрос не может быть причиной нагрузки в 217% CPU**. Он слишком легкий (особенно если по полю `id` есть индекс, что стандартно).
+
+### Почему тогда CPU загружен на 2 ядра?
+
+Есть две основные вероятности:
+
+1. **Огромный объем запросов (High QPS)**: Ваше приложение (судя по имени БД `rust_gpt` и метрикам на `8080` порту, это Rust-сервис) спамит базу этим запросом тысячи раз в секунду (например, из-за баги в цикле, агрессивного поллинга или нагрузочного тестирования). По отдельности запросы мгновенные, но их суммарный поток загружает процессор.
+2. **Мы "промахнулись"**: Тяжелый запрос (например, сложная аналитика или `autovacuum`) только что отработал, снял нагрузку, и в момент вашего снимка в системе остались только эти легкие фоновые/проверочные запросы.
+
+---
+
+### Что проверить прямо сейчас (следующие шаги)
+
+#### Шаг 1. Оцените масштаб подключений
+Выполните этот запрос, чтобы понять, не скопилось ли огромное число зависших или активных сессий:
+```sql
+SELECT state, count(*) 
+FROM pg_stat_activity 
+GROUP BY state;
+```
+*Если вы видите сотни подключений в состоянии `active` или `idle in transaction`, проблема в утечке соединений или блокировках на стороне приложения.*
+
+#### Шаг 2. Найдите реального "пожирателя" CPU через статистику
+Если в базе включено расширение `pg_stat_statements` (оно есть в большинстве готовых образов PostgreSQL), оно покажет не то, что выполняется *прямо сейчас*, а то, что **съело больше всего процессорного времени в сумме**:
+```sql
+SELECT 
+    substring(query, 1, 100) AS short_query, 
+    calls, 
+    round(total_exec_time::numeric, 2) AS total_time_ms, 
+    round(mean_exec_time::numeric, 2) AS avg_time_ms
+FROM pg_stat_statements 
+ORDER BY total_exec_time DESC 
+LIMIT 5;
+```
+*(Если получите ошибку `relation "pg_stat_statements" does not exist`, значит расширение не включено, переходите к Шагу 3).*
+
+#### Шаг 3. Проверьте логи приложения (Rust)
+Посмотрите логи вашего сервиса на порту `8080`. Ищите:
+* Повторяющиеся запросы с огромной частотой.
+* Ошибки таймаутов, которые могут вызывать цикл бесконечных ретраев (retry).
+* Недавний запуск нагрузочного теста (load test).
+
+#### Шаг 4. Проверьте, не работает ли Autovacuum
+Иногда `autovacuum` не попадает под фильтр `state = 'active'` так, как мы ожидаем, или работает фоново. Проверьте его явно:
+```sql
+SELECT pid, now() - xact_start AS duration, query, state 
+FROM pg_stat_activity 
+WHERE query LIKE '%autovacuum%' OR query LIKE '%vacuum%';
+```
+
+**Резюме:** Скорее всего, проблема не в *тяжести* одного запроса, а в его *количестве* (спам от приложения) либо мы просто не поймали тяжелый запрос в момент снимка. Шаг 2 (`pg_stat_statements`) даст наиболее точный ответ, если он доступен.
+
+### USER
+rust_gpt=# 
+
+```sql
+SELECT state, count(*) 
+FROM pg_stat_activity 
+GROUP BY state;
+```
+ state  | count 
+--------+-------
+        |     5
+ active |     1
+ idle   |    16
+(3 rows)
+
+rust_gpt=# 
+```
+SELECT 
+    substring(query, 1, 100) AS short_query, 
+    calls, 
+    round(total_exec_time::numeric, 2) AS total_time_ms, 
+    round(mean_exec_time::numeric, 2) AS avg_time_ms
+FROM pg_stat_statements 
+ORDER BY total_exec_time DESC 
+LIMIT 5;
+```
+ERROR:  relation "pg_stat_statements" does not exist
+LINE 6: FROM pg_stat_statements 
+             ^
+rust_gpt=# 
+```
+SELECT pid, now() - xact_start AS duration, query, state 
+FROM pg_stat_activity 
+WHERE query LIKE '%autovacuum%' OR query LIKE '%vacuum%';
+```
+  pid  | duration |                           query                           | state  
+-------+----------+-----------------------------------------------------------+--------
+ 33509 | 00:00:00 | SELECT pid, now() - xact_start AS duration, query, state +| active
+       |          | FROM pg_stat_activity                                    +| 
+       |          | WHERE query LIKE '%autovacuum%' OR query LIKE '%vacuum%'; | 
+(1 row)
+
+### ASSISTANT
+Отличные данные. Картина полностью проясняется:
+
+1. **Шторма соединений нет**: всего 1 активное подключение и 16 в ожидании (`idle`). Это абсолютно здоровая картина для работающего приложения.
+2. **Autovacuum не работает**: он не является причиной текущей нагрузки.
+3. **`pg_stat_statements` выключен**: поэтому мы не видим исторической статистики по запросам.
+
+### Главный вывод
+Мы просто **не поймали момент пиковой нагрузки**. Тяжелый запрос (или короткий пакет из тысяч запросов) отработал, поднял CPU до 217% на несколько секунд, и к моменту выполнения ваших диагностических команд он уже завершился. Сейчас база "отдыхает".
+Чтобы поймать "призрака" и точно узнать причину, нужно настроить базу на сбор улик. Вот 3 шага, которые решат эту задачу.
+
+---
+
+### Шаг 1. Включите логирование медленных запросов (без перезагрузки)
+Это самый быстрый способ заставить PostgreSQL сообщить вам, если какой-то запрос начнет "жрать" процессор.
+
+Выполните в `psql` под суперпользователем (обычно `postgres`):
+```sql
+-- Логировать любой запрос, который выполняется дольше 500 миллисекунд
+ALTER SYSTEM SET log_min_duration_statement = 500;
+
+-- Применяем настройки на лету (перезагрузка контейнера не нужна)
+SELECT pg_reload_conf();
+```
+Теперь, если нагрузка повторится, вы сможете увидеть виновника в логах Docker:
+```bash
+docker logs postgresql --tail 50 | grep "duration:"
+```
+*(Замените `postgresql` на имя или ID вашего контейнера, если он называется иначе).*
+
+---
+
+### Шаг 2. Включите `pg_stat_statements` (Настоятельно рекомендуется)
+Это "черный ящик" PostgreSQL, который навсегда решит проблему "мы не поймали момент". Он накапливает статистику по всем запросам, даже если они уже завершились.
+
+**Важно:** Для этого потребуется **однократная перезагрузка** контейнера.
+
+1. Включите библиотеку в настройках:
+   ```sql
+   ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+   ```
+   ```sql
+   ALTER SYSTEM SET pg_stat_statements.track = 'all';
+   ```
+2. Перезапустите контейнер:
+   ```bash
+   docker restart postgresql
+   ```
+3. Подключитесь к базе и создайте расширение:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+   ```
+4. **В следующий раз**, когда вы увидите высокий CPU, просто выполните ваш прошлый запрос к `pg_stat_statements`, и он точно покажет, какой запрос суммарно потратил больше всего процессорного времени.
+
+---
+
+### Шаг 3. Проверьте текущие логи на наличие прошлых аномалий
+Возможно, PostgreSQL уже записал что-то полезное до того, как вы начали диагностику. Проверьте конец лога:
+```bash
+docker logs postgresql --tail 100
+```
+Ищите сообщения вроде:
+* `duration: 1500.000 ms` (медленные запросы)
+* `temporary file: ...` (запрос не поместился в `work_mem` и начал писать сортировки на диск, что сильно грузит CPU)
+* `automatic vacuum of table "..."` (если вакуум все-таки проскакивал)
+
+---
+
+### Резюме
+Сейчас с базой **всё в порядке**, угрозы стабильности нет. Нагрузка была кратковременной. 
+Сделайте **Шаг 1** прямо сейчас (это безопасно и не требует перезагрузки), а при возможности сделайте **Шаг 2**. Это даст вам полный контроль над ситуацией при следующем скачке CPU.
+
+### USER
+rust_gpt=#
+```sql
+SELECT DISTINCT usename FROM pg_stat_activity WHERE usename IS NOT NULL;
+```
+ usename 
+---------
+ user
+(1 row)
+
+rust_gpt=# 
+```sql
+select queryid as queryid, round(total_exec_time::numeric, 2) as total_time, calls, round(mean_exec_time::numeric, 2) as mean, round(100 * total_exec_time::numeric / sum(total_exec_time::numeric) over ()::numeric, 2) as percentage_overall from pg_stat_statements order by total_exec_time desc limit 5;
+```
+```
+       queryid        | total_time | calls  | mean  | percentage_overall 
+----------------------+------------+--------+-------+--------------------
+  2563716151836050748 |   16314.91 | 678098 |  0.02 |              99.85
+ -4892161349233715952 |      11.18 |      1 | 11.18 |               0.07
+  1922117583104590001 |       5.71 |      1 |  5.71 |               0.03
+  3628113194934645337 |       4.34 |      1 |  4.34 |               0.03
+  8020762223485865214 |       2.69 |      5 |  0.54 |               0.02
+(5 rows)
+```
+rust_gpt=# 
+```sql
+select query,calls from pg_stat_statements where queryid='2563716151836050748';
+```
+```
+                                           query                                            | calls  
+--------------------------------------------------------------------------------------------+--------
+ SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT $1 | 888891
+(1 row)
+```
+
+rust_gpt=# 
+```sql
+select query,calls from pg_stat_statements where queryid='-4892161349233715952';
+```
+```
+                                         query                                                | calls 
+----------------------------------------------------------------------------------------------------+-------
+ SELECT datname, numbackends, xact_commit, xact_rollback, blks_read, blks_hit FROM pg_stat_database |     1
+(1 row)
+```
+
+### ASSISTANT
+**Виновник найден!** 🎯
+
+## Диагностика
+
+Запрос `SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT $1` 
+был выполнен **888,891 раз** и съел **99.85%** всего процессорного времени базы данных.
+
+### Парадокс ситуации
+- Каждый отдельный вызов выполняется за **0.02 мс** (мгновенно)
+- Но из-за **почти 900 тысяч вызовов** суммарная нагрузка составила 16 секунд CPU-времени
+- Это классический случай **"death by a thousand cuts"** (смерть от тысячи порезов)
+
+## Что это значит
+
+Ваше приложение (судя по имени БД `rust_gpt`, это Rust-сервис) **спамит базу одним и тем же запросом** с бешеной частотой. По отдельности запросы легкие, но их суммарный поток загружает процессор.
+
+## Возможные причины
+
+1. **Баг в коде**: Цикл без задержки, который постоянно дергает этот запрос
+2. **Агрессивный polling**: Опрос состояния каждые несколько миллисекунд вместо разумных интервалов
+3. **Отсутствие кэширования**: Каждый раз ходим в БД, хотя данные можно закэшировать
+4. **Нагрузочное тестирование**: Запущен load test, который генерирует эту нагрузку искусственно
+
+## Что делать прямо сейчас
+
+### 1. Найдите код, который делает этот запрос
+В вашем Rust-приложении ищите:
+- Функции, которые вызывают `SELECT ... FROM orders ORDER BY id LIMIT`
+- Циклы или polling-механизмы
+- Обработчики HTTP-запросов, которые могут вызываться слишком часто
+
+### 2. Добавьте кэширование
+Если этот запрос вызывается часто с одинаковыми параметрами, кэшируйте результат:
+- **In-memory кэш** (например, `moka` или `dashmap` в Rust)
+- **Redis** для распределенного кэширования
+- **TTL** (time-to-live) для автоматического обновления
+
+### 3. Увеличьте интервал между запросами
+Если это polling, измените интервал с миллисекунд на разумные значения (например, 1-5 секунд вместо 10-100 мс).
+
+### 4. Проверьте, не запущен ли load test
+Посмотрите процессы на хосте:
+```bash
+ps aux | grep -E "(wrk|vegeta|hey|k6|locust)"
+```
+
+## Быстрая проверка
+
+Чтобы убедиться, что нагрузка идет именно от вашего приложения, выполните:
+```bash
+docker stats --no-stream postgresql
+```
+Если CPU снова подскочит до 200%+, значит приложение продолжает спамить. Если упал до нормальных значений — возможно, это был разовый всплеск (например, нагрузочный тест завершился).
+
+## Резюме
+
+Проблема не в PostgreSQL и не в структуре запроса. Проблема в **архитектуре приложения**, которое делает слишком много одинаковых запросов. Оптимизация на стороне кода (кэширование + разумные интервалы) решит проблему полностью.
+
+### Разные сценариии оптимизирования кода actix_web
+ 
+```
+cat src/main.rs 
+```
+```
+mod models;
+mod routes;
+
+use actix_web::{web, App, HttpServer};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use dotenvy::dotenv;
+use std::env;
+use std::sync::Arc;
+
+use routes::{json_handler, metrics_handler, orders_handler};
+
+/// Создаёт пул соединений с PostgreSQL
+fn create_pool(database_url: &str) -> Result<Pool, anyhow::Error> {
+    let config = database_url.parse::<tokio_postgres::Config>()?;
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let manager = Manager::from_config(config, tokio_postgres::NoTls, mgr_config);
+    let pool = Pool::builder(manager)
+        .max_size(16)
+        .runtime(Runtime::Tokio1)
+        .build()?;
+    Ok(pool)
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let _ = dotenv();
+
+    let database_url = env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set (in .env or environment)");
+
+    let pool = match create_pool(&database_url) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("Failed to create DB pool: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let bind_addr = env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
+
+    println!("Starting server on http://{}", bind_addr);
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .service(json_handler)
+            .service(orders_handler)
+            .service(metrics_handler)
+    })
+    .workers(num_cpus::get()) // используем все ядра
+    .bind(&bind_addr)?
+    .run()
+    .await
+}
+```
+
+Используя 1n-memory кэш (например, moka и dashmap в Rust)
+
+### ASSISTANT
+Отличный код! Видно, что используется современный стек: `actix-web`, `deadpool-postgres` и асинхронность. 
+
+Проблема с запросом `SELECT ... FROM orders ORDER BY id LIMIT 1`, который выполняется ~900 000 раз, почти всегда указывает на **агрессивный polling** (кто-то или что-то постоянно спрашивает "дай последнюю запись" каждые несколько миллисекунд).
+
+Поскольку результат этого запроса меняется редко (новые заказы не появляются каждую миллисекунду), **in-memory кэширование** — идеальное решение. Оно снизит нагрузку на CPU с 200% до ~0%.
+
+
+### 3 конкретных сценария оптимизации с примерами кода.
+
+---
+
+### Подготовка: Добавление зависимостей
+Добавьте в `Cargo.toml` выбранные библиотеки. Для асинхронного Actix-web лучше всего подходит **`moka`** (у неё есть нативная поддержка `async`), а **`dashmap`** хорош для lock-free структур.
+
+```toml
+[dependencies]
+# ... ваши текущие зависимости ...
+moka = { version = "0.12", features = ["future"] } # Асинхронный кэш с TTL
+dashmap = "5.5" # Если выберете сценарий с DashMap
+tokio = { version = "1", features = ["full"] }
+```
+
+---
+
+### Сценарий 1: Кэширование с TTL (Time-To-Live) через `moka` (Рекомендуемый)
+**Идея:** Мы кэшируем результат запроса на короткое время (например, на 2 секунды). Все запросы в этот интервал получают данные из RAM, не трогая PostgreSQL.
+
+**Плюсы:** Простота, защита от "cache stampede" (когда много запросов одновременно попадают на просроченный кэш).
+
+```rust
+// src/main.rs
+use actix_web::{web, App, HttpServer};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use dotenvy::dotenv;
+use moka::future::Cache;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+// 1. Создаем структуру состояния приложения
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: Arc<Pool>,
+    // Кэш: ключ - строка (или unit type ()), значение - вектор ваших моделей
+    // TTL установлен на 2 секунды
+    pub orders_cache: Cache<String, Vec<models::Order>>, 
+}
+
+fn create_pool(database_url: &str) -> Result<Pool, anyhow::Error> {
+    // ... ваш существующий код create_pool ...
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let _ = dotenv();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = Arc::new(create_pool(&database_url).expect("Failed to create pool"));
+
+    // 2. Инициализируем кэш Moka
+    let cache: Cache<String, Vec<models::Order>> = Cache::builder()
+        .time_to_live(Duration::from_secs(2)) // Живет 2 секунды
+        .time_to_idle(Duration::from_secs(1)) // Сбрасывается, если не используется 1 сек
+        .build();
+
+    let app_state = web::Data::new(AppState {
+        db_pool: pool,
+        orders_cache: cache,
+    });
+
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(app_state.clone())
+            .service(routes::json_handler)
+            .service(routes::orders_handler) // Внутри этого хендлера будем использовать кэш
+            .service(routes::metrics_handler)
+    })
+    .workers(num_cpus::get())
+    .bind(&bind_addr)?
+    .run()
+    .await
+}
+```
+
+**Как изменить хендлер (`src/routes.rs`):**
+```rust
+use actix_web::{get, web, HttpResponse, Responder};
+use crate::AppState;
+
+#[get("/orders/latest")]
+pub async fn orders_handler(state: web::Data<AppState>) -> impl Responder {
+    let cache_key = "latest_orders".to_string();
+
+    // get_with гарантирует, что даже при 1000 одновременных запросов 
+    // к просроченному кэшу, запрос в БД выполнится ТОЛЬКО ОДИН РАЗ.
+    let orders = state.orders_cache.get_with(cache_key, async {
+        // ЭТОТ КОД ВЫПОЛНИТСЯ ТОЛЬКО ПРИ ОТСУТСТВИИ КЭША
+        let client = state.db_pool.get().await.unwrap();
+        let rows = client.query(
+            "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10",
+            &[],
+        ).await.unwrap();
+        
+        // Преобразование rows в Vec<models::Order> (ваша логика)
+        rows.into_iter().map(|row| models::Order { /* ... */ }).collect()
+    }).await;
+
+    HttpResponse::Ok().json(orders)
+}
+```
+
+---
+
+### Сценарий 2: Фоновое обновление (Zero-Latency Reads)
+**Идея:** Хендлеры вообще **никогда** не ходят в БД. Отдельная фоновая задача (tokio task) раз в секунду сама опрашивает БД и обновляет данные в памяти.
+
+**Плюсы:** Абсолютно нулевая задержка для клиентов, полная изоляция нагрузки на БД от трафика пользователей.
+
+```rust
+// В main.rs
+use std::sync::Arc;
+use tokio::sync::RwLock; // Или DashMap, если записей много
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: Arc<Pool>,
+    // Храним последние заказы в памяти
+    pub latest_orders: Arc<RwLock<Vec<models::Order>>>,
+}
+
+// Фоновая задача для обновления кэша
+async fn cache_refresher(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1)); // Раз в секунду
+    loop {
+        interval.tick().await;
+        
+        // Берем соединение и делаем запрос
+        if let Ok(client) = state.db_pool.get().await {
+            if let Ok(rows) = client.query(
+                "SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10", 
+                &[]
+            ).await {
+                let new_orders: Vec<models::Order> = rows.into_iter().map(|row| { /* маппинг */ }).collect();
+                
+                // Обновляем состояние (write lock)
+                *state.latest_orders.write().await = new_orders;
+            }
+        }
+    }
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // ... инициализация pool ...
+    
+    let app_state = web::Data::new(AppState {
+        db_pool: pool.clone(),
+        latest_orders: Arc::new(RwLock::new(Vec::new())),
+    });
+
+    // Запускаем фоновую задачу ПЕРЕД стартом сервера
+    let refresher_state = app_state.get_ref().clone();
+    tokio::spawn(async move {
+        cache_refresher(refresher_state).await;
+    });
+
+    // ... HttpServer::new ...
+}
+```
+*В хендлере вы просто делаете `state.latest_orders.read().await` и отдаете данные. Запросов к БД из хендлера больше нет.*
+
+---
+
+### Сценарий 3: `DashMap` для кэширования по параметру (Если запрос изменится)
+**Идея:** Если в будущем запрос станет вида `SELECT ... FROM orders WHERE id = $1`, и разные клиенты запрашивают *разные* заказы, `moka` всё ещё хороша, но `DashMap` даст максимальную производительность при чтении без блокировок.
+
+```rust
+use dashmap::DashMap;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: Arc<Pool>,
+    // Кэш: Order ID -> Order Data
+    pub order_cache: Arc<DashMap<i32, models::Order>>,
+}
+
+#[get("/orders/{id}")]
+pub async fn get_order(path: web::Path<i32>, state: web::Data<AppState>) -> impl Responder {
+    let order_id = path.into_inner();
+
+    // 1. Пробуем прочитать из кэша (очень быстро, без блокировок)
+    if let Some(order) = state.order_cache.get(&order_id) {
+        return HttpResponse::Ok().json(order.value());
+    }
+
+    // 2. Если нет в кэше (Cache Miss), идем в БД
+    let client = state.db_pool.get().await.unwrap();
+    let row = client.query_one(
+        "SELECT id, customer_id, product_id, quantity, total_cents FROM orders WHERE id = $1",
+        &[&order_id],
+    ).await.unwrap();
+    
+    let order = models::Order { /* маппинг */ };
+
+    // 3. Кладем в кэш для следующих запросов
+    state.order_cache.insert(order_id, order.clone());
+
+    HttpResponse::Ok().json(order)
+}
+```
+*Примечание: Для вашего текущего запроса `LIMIT 1` без параметров этот сценарий менее применим, чем Сценарий 1 или 2, но он идеален для паттерна "Cache-aside".*
+
+---
+
+### Сценарий 4: Архитектурный (Устранение причины, а не симптома)
+Прежде чем внедрять кэш, задайте вопрос: **почему** клиент делает 900 000 запросов?
+Если это фронтенд, который опрашивает сервер каждые 100мс через `setInterval` в JavaScript, чтобы показать "новые заказы", то кэш — это пластырь.
+
+**Лучшее решение:**
+Замените HTTP-polling на **Server-Sent Events (SSE)** или **WebSockets**.
+1. Клиент открывает *одно* постоянное соединение.
+2. Сервер сам пушит данные клиенту только тогда, когда в БД появляется новый заказ (например, через `LISTEN/NOTIFY` в PostgreSQL).
+3. Нагрузка на сеть и CPU падает на 99.9%.
+
+### Что выбрать?
+1. Если нужно **быстрое и надежное решение прямо сейчас** → **Сценарий 1 (`moka`)**. Он безопасен, асинхронен и решит проблему 217% CPU за 5 минут.
+2. Если данные меняются предсказуемо и нужно **максимальное быстродействие** → **Сценарий 2 (Фоновое обновление)**.
+3. Если это баг фронтенда → **Сценарий 4 (SSE/WebSockets)**.
+
+Рекомендую начать с **Сценария 1**. После его внедрения `docker stats` покажет падение CPU контейнера `postgresql` до <5%.
