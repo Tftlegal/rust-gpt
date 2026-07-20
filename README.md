@@ -644,7 +644,8 @@ Bytes
 hyper
 ```
 
-или вообще
+
+или вообще:
 
 ```
 wrk
@@ -1305,6 +1306,7 @@ Transfer/sec:     13.89MB
 
 ```
 wrk -t8 -c64 -d30s http://localhost:8080/orders
+```
 ```
 Running 30s test @ http://localhost:8080/orders
   8 threads and 64 connections
