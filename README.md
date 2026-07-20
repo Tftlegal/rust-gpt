@@ -183,6 +183,7 @@ Transfer/sec:      1.02MB
 ```
 wrk -t8 -c64 -d30s http://localhost:8080/orders
 ```
+```
 Running 30s test @ http://localhost:8080/orders
   8 threads and 64 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
@@ -191,6 +192,7 @@ Running 30s test @ http://localhost:8080/orders
   131206 requests in 30.03s, 41.42MB read
 Requests/sec:   4369.17
 Transfer/sec:      1.38MB
+```
 
 ```
 wrk -t8 -c64 -d30s http://localhost:8080/json  
