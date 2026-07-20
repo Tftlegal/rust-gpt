@@ -96,7 +96,7 @@ docker run -d --name postgresql  -e POSTGRES_USER=user -e POSTGRES_PASSWORD=pass
 
 ### Создайте пользователя и базу (замените 'user' и 'password' на свои)
 ```
-docker exec postgresql -it bash
+docker exec -it postgresql bash
 ```
 
 #sudo -u postgres psql -c "CREATE USER user WITH PASSWORD 'password';"
@@ -196,6 +196,7 @@ Transfer/sec:      1.38MB
 
 ```
 wrk -t8 -c64 -d30s http://localhost:8080/json  
+```
 ```
 ```
 Running 30s test @ http://localhost:8080/json
@@ -2056,9 +2057,11 @@ wrk -t8 -c64 -d30s http://127.0.0.1:8080/json
 Такой сервер обычно еще на **20–40% быстрее**, чем обычный Hyper, и именно он уже приближается к пределу производительности HTTP-стека.
 
 
+
 ## Actix base 90k/4k RPS
 
-Мы реализуем приложение на **Actix-web** с тремя эндпоинтами:
+
+Реализуем приложение на **Actix-web** с тремя эндпоинтами:
 
 - `GET /json` – статический JSON `{"message":"Hello, World!"}`
 - `GET /orders` – список заказов из PostgreSQL (таблица `orders`)
@@ -2427,7 +2430,15 @@ SELECT pid, query, state FROM pg_stat_activity WHERE query LIKE '%autovacuum%';
 **Вывод:** Серверу ничего не угрожает (памяти достаточно, общая загрузка CPU низкая), но конкретный запрос в PostgreSQL работает неэффективно и "съедает" 2 ядра. Оптимизация индексов или самого запроса решит проблему.
 
 ### USER
-rust_gpt=# SELECT 
+
+rust_gpt=# 
+```
+SELECT * FROM pg_stat_activity;
+```
+
+rust_gpt=#
+```
+SELECT 
     pid, 
     now() - pg_stat_activity.query_start AS duration, 
     query, 
@@ -2437,10 +2448,12 @@ WHERE state = 'active'
   AND pid <> pg_backend_pid() 
 ORDER BY duration DESC 
 LIMIT 5;
+```
   pid  |     duration     |                                           query                                            | state  
 -------+------------------+--------------------------------------------------------------------------------------------+--------
  27160 | -00:00:00.001112 | SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10 | active
  27158 | -00:00:00.001119 | SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT 10 | active
+
 
 ### ASSISTANT
 Отрицательное значение длительности (`-00:00:00.001112`) — это известный артефакт PostgreSQL, который означает, что запрос выполнился **быстрее миллисекунды** (практически мгновенно). 
@@ -2505,13 +2518,14 @@ SELECT state, count(*)
 FROM pg_stat_activity 
 GROUP BY state;
 ```
+```
  state  | count 
 --------+-------
         |     5
  active |     1
  idle   |    16
 (3 rows)
-
+```
 rust_gpt=# 
 ```
 SELECT 
@@ -2523,8 +2537,10 @@ FROM pg_stat_statements
 ORDER BY total_exec_time DESC 
 LIMIT 5;
 ```
+```
 ERROR:  relation "pg_stat_statements" does not exist
 LINE 6: FROM pg_stat_statements 
+```
              ^
 rust_gpt=# 
 ```
@@ -2532,15 +2548,17 @@ SELECT pid, now() - xact_start AS duration, query, state
 FROM pg_stat_activity 
 WHERE query LIKE '%autovacuum%' OR query LIKE '%vacuum%';
 ```
+```
   pid  | duration |                           query                           | state  
 -------+----------+-----------------------------------------------------------+--------
  33509 | 00:00:00 | SELECT pid, now() - xact_start AS duration, query, state +| active
        |          | FROM pg_stat_activity                                    +| 
        |          | WHERE query LIKE '%autovacuum%' OR query LIKE '%vacuum%'; | 
 (1 row)
+```
 
 ### ASSISTANT
-Отличные данные. Картина полностью проясняется:
+Картина полностью проясняется:
 
 1. **Шторма соединений нет**: всего 1 активное подключение и 16 в ожидании (`idle`). Это абсолютно здоровая картина для работающего приложения.
 2. **Autovacuum не работает**: он не является причиной текущей нагрузки.
@@ -2616,11 +2634,12 @@ rust_gpt=#
 ```sql
 SELECT DISTINCT usename FROM pg_stat_activity WHERE usename IS NOT NULL;
 ```
+```
  usename 
 ---------
  user
 (1 row)
-
+```
 rust_gpt=# 
 ```sql
 select queryid as queryid, round(total_exec_time::numeric, 2) as total_time, calls, round(mean_exec_time::numeric, 2) as mean, round(100 * total_exec_time::numeric / sum(total_exec_time::numeric) over ()::numeric, 2) as percentage_overall from pg_stat_statements order by total_exec_time desc limit 5;
@@ -2639,8 +2658,8 @@ rust_gpt=#
 ```sql
 select query,calls from pg_stat_statements where queryid='2563716151836050748';
 ```
-```
-                                           query                                            | calls  
+```   
+                                        query                                            | calls  
 --------------------------------------------------------------------------------------------+--------
  SELECT id, customer_id, product_id, quantity, total_cents FROM orders ORDER BY id LIMIT $1 | 888891
 (1 row)
@@ -2657,7 +2676,6 @@ select query,calls from pg_stat_statements where queryid='-4892161349233715952';
 (1 row)
 ```
 
-### ASSISTANT
 **Виновник найден!** 🎯
 
 ## Диагностика
@@ -3015,3 +3033,6 @@ pub async fn get_order(path: web::Path<i32>, state: web::Data<AppState>) -> impl
 3. Если это баг фронтенда → **Сценарий 4 (SSE/WebSockets)**.
 
 Рекомендую начать с **Сценария 1**. После его внедрения `docker stats` покажет падение CPU контейнера `postgresql` до <5%.
+
+
+BLAIZING FAST?
