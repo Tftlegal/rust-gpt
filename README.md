@@ -198,7 +198,6 @@ Transfer/sec:      1.38MB
 wrk -t8 -c64 -d30s http://localhost:8080/json  
 ```
 ```
-```
 Running 30s test @ http://localhost:8080/json
   8 threads and 64 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
